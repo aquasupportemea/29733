@@ -1,0 +1,226 @@
+---build:  stage: build
+  image:    name: registry.access.redhat.com/ubi8/buildah:latest
+  variables:    DOCKERBUILD_DIR: "$CI_PROJECT_DIR"    DOCKERFILE_NAME: Dockerfile
+    REGISTRY: "$CI_REGISTRY"    REGISTRY_USER: "$CI_REGISTRY_USER"    REGISTRY_PASSWORD: "$CI_REGISTRY_PASSWORD"    IMAGE_PATH: ''  before_script:  - buildah version
+  script:  - |
+    if [[ "${CI_COMMIT_BRANCH}" == "${CI_DEFAULT_BRANCH}" ]]; then
+      tag="${CI_COMMIT_SHA}"      echo "Running on default branch '$CI_DEFAULT_BRANCH': tag = ${tag}"    else
+      tag=":${CI_COMMIT_REF_SLUG}"      echo "Running on branch '$CI_COMMIT_BRANCH': tag = ${tag}"    fi
+  - "if [[ \"${REGISTRY}\" != \"${CI_REGISTRY}\" ]]; then\n  REGISTRY_IMAGE=\"${REGISTRY}/${IMAGE_PATH}/${CI_PROJECT_NAME}\"\nelse\n    \ REGISTRY_IMAGE=${CI_REGISTRY_IMAGE}\nfi    \n"  - export REGISTRY_AUTH_FILE=${HOME}/auth.json
+  - echo "$REGISTRY_PASSWORD" | buildah login -u "$REGISTRY_USER" --password-stdin
+    $REGISTRY
+  - export STORAGE_DRIVER=vfs
+  - buildah bud -f ${DOCKERBUILD_DIR}/${DOCKERFILE_NAME} -t ${CI_PROJECT_NAME} .
+  - CONTAINER_ID=$(buildah from ${CI_PROJECT_NAME})
+  - buildah commit --squash $CONTAINER_ID ${REGISTRY_IMAGE}/${CI_COMMIT_BRANCH}:${tag}  - buildah push ${REGISTRY_IMAGE}/${CI_COMMIT_BRANCH}:${tag}  - |
+    if [[ "${CI_COMMIT_BRANCH}" == "${CI_DEFAULT_BRANCH}" ]]; then
+      buildah commit --squash $CONTAINER_ID ${REGISTRY_IMAGE}:latest
+      buildah push ${REGISTRY_IMAGE}:latest
+    fi
+  rules:  - if: "$CI_COMMIT_BRANCH"    exists:    - Dockerfile
+vulnerability-report:  image: apteno/alpine-jq
+  stage: vulnerability_report
+  rules:  - if: "$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH"  dependencies:  - sast
+  - container_scanning
+  script:  - ls
+  - echo "Checking DAST report"  - |
+    if [ -r gl-dast-report.json ]; then
+      echo "Dast Report found and readable, number of vulnerabilities found: "      DAST_Vulnerabilities=$(cat gl-dast-report.json | jq '.vulnerabilities | map(select(.severity == "High" or .severity == "Medium" or .severity == "Critical" or .severity == "Unknown")) | length')
+      echo "${DAST_Vulnerabilities}"      if [ ${DAST_Vulnerabilities} -gt 0 ]; then
+        echo "Outstanding DAST vulnerabilities found, these must be fixed in accordance with Engineering Standards before Pipeline will pass"        exit 1
+      fi
+    else
+      echo "No Dast Report found or not readable"    fi
+  - echo "Checking SAST report"  - |
+    if [ -r gl-sast-report.json ]; then
+      echo "Sast Report found and readable, number of vulnerabilities found: "      SAST_Vulnerabilities=$(cat gl-sast-report.json | jq '.vulnerabilities | map(select(.severity == "High" or .severity == "Medium" or .severity == "Critical" or .severity == "Unknown")) | length')
+      echo "${SAST_Vulnerabilities}"      if [ ${SAST_Vulnerabilities} -gt 0 ]; then
+        echo "Outstanding SAST vulnerabilities found, these must be fixed in accordance with Engineering Standards before Pipeline will pass"        exit 1
+      fi
+    else
+      echo "No Sast Report found or not readable"    fi
+  - echo "Checking Container Scan report"  - |
+    if [ -r gl-container-scanning-report.json ]; then
+      echo "Container Scanning Report found and readable, number of vulnerabilities found: "      Container_Vulnerabilities=$(cat gl-container-scanning-report.json | jq '.vulnerabilities | map(select(.severity == "High" or .severity == "Medium" or .severity == "Critical" or .severity == "Unknown")) | length')
+      echo "${Container_Vulnerabilities}"      if [ ${Container_Vulnerabilities} -gt 0 ]; then
+        echo "Outstanding Container Scan vulnerabilities found, these must be fixed in accordance with Engineering Standards before Pipeline will pass"        exit 1
+      fi
+    else
+      echo "No Container Scanning Report found or not readable"    fi
+  - echo "Checking Dependency scan report"  - |
+    if [ -r gl-dependency-scanning-report.json ]; then
+      echo "Dependency Scanning Report found and readable, number of vulnerabilities found: "      Dependency_Vulnerabilities=$(cat gl-dependency-scanning-report.json | jq '.vulnerabilities | map(select(.severity == "High" or .severity == "Medium" or .severity == "Critical" or .severity == "Unknown")) | length')
+      echo "${Dependency_Vulnerabilities}"      if [ ${Dependency_Vulnerabilities} -gt 0 ]; then
+        echo "Outstanding Dependency Scan vulnerabilities found, these must be fixed in accordance with Engineering Standards before Pipeline will pass"        exit 1
+      fi
+    else
+      echo "No Dependency Scanning Report found or not readable"    fi
+variables:  SECURE_ANALYZERS_PREFIX: "$CI_TEMPLATE_REGISTRY_HOST/security-products"  SAST_IMAGE_SUFFIX: ''  SAST_EXCLUDED_ANALYZERS: ''  SAST_EXCLUDED_PATHS: spec, test, tests, tmp
+  SCAN_KUBERNETES_MANIFESTS: 'false'  LICENSE_MANAGEMENT_SETUP_CMD: ''  LICENSE_MANAGEMENT_VERSION: 4  CS_ANALYZER_IMAGE: "$CI_TEMPLATE_REGISTRY_HOST/security-products/container-scanning:5"  SECRET_DETECTION_IMAGE_SUFFIX: ''  SECRETS_ANALYZER_VERSION: '4'  SECRET_DETECTION_EXCLUDED_PATHS: ''sast:  stage: test
+  artifacts:    reports:      sast:      - gl-sast-report.json
+    name: sast
+    paths:    - gl-sast-report.json
+    when: always
+  rules:  - when: never
+  variables:    SEARCH_MAX_DEPTH: 4  script:  - echo "$CI_JOB_NAME is used for configuration only, and its script should not be    executed"  - exit 1
+".sast-analyzer":
+  stage: test
+  artifacts:    reports:      sast: gl-sast-report.json
+    name: sast
+    paths:    - gl-sast-report.json
+    when: always
+  rules:  - when: never
+  variables:    SEARCH_MAX_DEPTH: 4  script:  - "/analyzer run"  extends: sast
+  allow_failure: truebandit-sast:  stage: test
+  artifacts:    reports:      sast:      - gl-sast-report.json
+    name: sast
+    paths:    - gl-sast-report.json
+    when: always
+  rules:  - if: "$SAST_DISABLED"    when: never
+  - if: "$SAST_EXCLUDED_ANALYZERS =~ /bandit/"    when: never
+  - if: "$CI_COMMIT_BRANCH"    exists:    - "**/*.py"  variables:    SEARCH_MAX_DEPTH: 4    SAST_ANALYZER_IMAGE_TAG: 2    SAST_ANALYZER_IMAGE: "$SECURE_ANALYZERS_PREFIX/bandit:$SAST_ANALYZER_IMAGE_TAG"  script:  - "/analyzer run"  extends: ".sast-analyzer"  allow_failure: true  image:    name: "$SAST_ANALYZER_IMAGE"brakeman-sast:  stage: test
+  artifacts:    reports:      sast:      - gl-sast-report.json
+    name: sast
+    paths:    - gl-sast-report.json
+    when: always
+  rules:  - if: "$SAST_DISABLED"    when: never
+  - if: "$SAST_EXCLUDED_ANALYZERS =~ /brakeman/"    when: never
+  - if: "$CI_COMMIT_BRANCH"    exists:    - "**/*.rb"    - "**/Gemfile"  variables:    SEARCH_MAX_DEPTH: 4    SAST_ANALYZER_IMAGE_TAG: 3    SAST_ANALYZER_IMAGE: "$SECURE_ANALYZERS_PREFIX/brakeman:$SAST_ANALYZER_IMAGE_TAG"  script:  - "/analyzer run"  extends: ".sast-analyzer"  allow_failure: true  image:    name: "$SAST_ANALYZER_IMAGE"eslint-sast:  stage: test
+  artifacts:    reports:      sast:      - gl-sast-report.json
+    name: sast
+    paths:    - gl-sast-report.json
+    when: always
+  rules:  - if: "$SAST_DISABLED"    when: never
+  - if: "$SAST_EXCLUDED_ANALYZERS =~ /eslint/"    when: never
+  - if: "$CI_COMMIT_BRANCH"    exists:    - "**/*.html"    - "**/*.js"    - "**/*.jsx"    - "**/*.ts"    - "**/*.tsx"  variables:    SEARCH_MAX_DEPTH: 4    SAST_ANALYZER_IMAGE_TAG: 2    SAST_ANALYZER_IMAGE: "$SECURE_ANALYZERS_PREFIX/eslint:$SAST_ANALYZER_IMAGE_TAG"  script:  - "/analyzer run"  extends: ".sast-analyzer"  allow_failure: true  image:    name: "$SAST_ANALYZER_IMAGE"flawfinder-sast:  stage: test
+  artifacts:    reports:      sast:      - gl-sast-report.json
+    name: sast
+    paths:    - gl-sast-report.json
+    when: always
+  rules:  - if: "$SAST_DISABLED"    when: never
+  - if: "$SAST_EXCLUDED_ANALYZERS =~ /flawfinder/"    when: never
+  - if: "$CI_COMMIT_BRANCH"    exists:    - "**/*.c"    - "**/*.cc"    - "**/*.cpp"    - "**/*.c++"    - "**/*.cp"    - "**/*.cxx"  variables:    SEARCH_MAX_DEPTH: 4    SAST_ANALYZER_IMAGE_TAG: 3    SAST_ANALYZER_IMAGE: "$SECURE_ANALYZERS_PREFIX/flawfinder:$SAST_ANALYZER_IMAGE_TAG"  script:  - "/analyzer run"  extends: ".sast-analyzer"  allow_failure: true  image:    name: "$SAST_ANALYZER_IMAGE"kubesec-sast:  stage: test
+  artifacts:    reports:      sast:      - gl-sast-report.json
+    name: sast
+    paths:    - gl-sast-report.json
+    when: always
+  rules:  - if: "$SAST_DISABLED"    when: never
+  - if: "$SAST_EXCLUDED_ANALYZERS =~ /kubesec/"    when: never
+  - if: "$CI_COMMIT_BRANCH && $SCAN_KUBERNETES_MANIFESTS == 'true'"  variables:    SEARCH_MAX_DEPTH: 4    SAST_ANALYZER_IMAGE_TAG: 3    SAST_ANALYZER_IMAGE: "$SECURE_ANALYZERS_PREFIX/kubesec:$SAST_ANALYZER_IMAGE_TAG"  script:  - "/analyzer run"  extends: ".sast-analyzer"  allow_failure: true  image:    name: "$SAST_ANALYZER_IMAGE"gosec-sast:  stage: test
+  artifacts:    reports:      sast:      - gl-sast-report.json
+    name: sast
+    paths:    - gl-sast-report.json
+    when: always
+  rules:  - if: "$SAST_DISABLED"    when: never
+  - if: "$SAST_EXCLUDED_ANALYZERS =~ /gosec/"    when: never
+  - if: "$CI_COMMIT_BRANCH"    exists:    - "**/*.go"  variables:    SEARCH_MAX_DEPTH: 4    SAST_ANALYZER_IMAGE_TAG: 3    SAST_ANALYZER_IMAGE: "$SECURE_ANALYZERS_PREFIX/gosec:$SAST_ANALYZER_IMAGE_TAG"  script:  - "/analyzer run"  extends: ".sast-analyzer"  allow_failure: true  image:    name: "$SAST_ANALYZER_IMAGE"".mobsf-sast":  stage: test
+  artifacts:    reports:      sast: gl-sast-report.json
+    name: sast
+    paths:    - gl-sast-report.json
+    when: always
+  rules:  - when: never
+  variables:    SEARCH_MAX_DEPTH: 4    SAST_ANALYZER_IMAGE_TAG: 3    SAST_ANALYZER_IMAGE: "$SECURE_ANALYZERS_PREFIX/mobsf:$SAST_ANALYZER_IMAGE_TAG"  script:  - "/analyzer run"  extends: ".sast-analyzer"  allow_failure: true  image:    name: "$SAST_ANALYZER_IMAGE"mobsf-android-sast:  stage: test
+  artifacts:    reports:      sast:      - gl-sast-report.json
+    name: sast
+    paths:    - gl-sast-report.json
+    when: always
+  rules:  - if: "$SAST_DISABLED"    when: never
+  - if: "$SAST_EXCLUDED_ANALYZERS =~ /mobsf/"    when: never
+  - if: "$CI_COMMIT_BRANCH && $SAST_EXPERIMENTAL_FEATURES == 'true'"    exists:    - "**/*.apk"    - "**/AndroidManifest.xml"  variables:    SEARCH_MAX_DEPTH: 4    SAST_ANALYZER_IMAGE_TAG: 3    SAST_ANALYZER_IMAGE: "$SECURE_ANALYZERS_PREFIX/mobsf:$SAST_ANALYZER_IMAGE_TAG"  script:  - "/analyzer run"  extends: ".mobsf-sast"  allow_failure: true  image:    name: "$SAST_ANALYZER_IMAGE"mobsf-ios-sast:  stage: test
+  artifacts:    reports:      sast:      - gl-sast-report.json
+    name: sast
+    paths:    - gl-sast-report.json
+    when: always
+  rules:  - if: "$SAST_DISABLED"    when: never
+  - if: "$SAST_EXCLUDED_ANALYZERS =~ /mobsf/"    when: never
+  - if: "$CI_COMMIT_BRANCH && $SAST_EXPERIMENTAL_FEATURES == 'true'"    exists:    - "**/*.ipa"    - "**/*.xcodeproj/*"  variables:    SEARCH_MAX_DEPTH: 4    SAST_ANALYZER_IMAGE_TAG: 3    SAST_ANALYZER_IMAGE: "$SECURE_ANALYZERS_PREFIX/mobsf:$SAST_ANALYZER_IMAGE_TAG"  script:  - "/analyzer run"  extends: ".mobsf-sast"  allow_failure: true  image:    name: "$SAST_ANALYZER_IMAGE"nodejs-scan-sast:  stage: test
+  artifacts:    reports:      sast:      - gl-sast-report.json
+    name: sast
+    paths:    - gl-sast-report.json
+    when: always
+  rules:  - if: "$SAST_DISABLED"    when: never
+  - if: "$SAST_EXCLUDED_ANALYZERS =~ /nodejs-scan/"    when: never
+  - if: "$CI_COMMIT_BRANCH"    exists:    - "**/package.json"  variables:    SEARCH_MAX_DEPTH: 4    SAST_ANALYZER_IMAGE_TAG: 3    SAST_ANALYZER_IMAGE: "$SECURE_ANALYZERS_PREFIX/nodejs-scan:$SAST_ANALYZER_IMAGE_TAG"  script:  - "/analyzer run"  extends: ".sast-analyzer"  allow_failure: true  image:    name: "$SAST_ANALYZER_IMAGE"phpcs-security-audit-sast:  stage: test
+  artifacts:    reports:      sast:      - gl-sast-report.json
+    name: sast
+    paths:    - gl-sast-report.json
+    when: always
+  rules:  - if: "$SAST_DISABLED"    when: never
+  - if: "$SAST_EXCLUDED_ANALYZERS =~ /phpcs-security-audit/"    when: never
+  - if: "$CI_COMMIT_BRANCH"    exists:    - "**/*.php"  variables:    SEARCH_MAX_DEPTH: 4    SAST_ANALYZER_IMAGE_TAG: 3    SAST_ANALYZER_IMAGE: "$SECURE_ANALYZERS_PREFIX/phpcs-security-audit:$SAST_ANALYZER_IMAGE_TAG"  script:  - "/analyzer run"  extends: ".sast-analyzer"  allow_failure: true  image:    name: "$SAST_ANALYZER_IMAGE"pmd-apex-sast:  stage: test
+  artifacts:    reports:      sast:      - gl-sast-report.json
+    name: sast
+    paths:    - gl-sast-report.json
+    when: always
+  rules:  - if: "$SAST_DISABLED"    when: never
+  - if: "$SAST_EXCLUDED_ANALYZERS =~ /pmd-apex/"    when: never
+  - if: "$CI_COMMIT_BRANCH"    exists:    - "**/*.cls"  variables:    SEARCH_MAX_DEPTH: 4    SAST_ANALYZER_IMAGE_TAG: 3    SAST_ANALYZER_IMAGE: "$SECURE_ANALYZERS_PREFIX/pmd-apex:$SAST_ANALYZER_IMAGE_TAG"  script:  - "/analyzer run"  extends: ".sast-analyzer"  allow_failure: true  image:    name: "$SAST_ANALYZER_IMAGE"security-code-scan-sast:  stage: test
+  artifacts:    reports:      sast:      - gl-sast-report.json
+    name: sast
+    paths:    - gl-sast-report.json
+    when: always
+  rules:  - if: "$SAST_DISABLED"    when: never
+  - if: "$SAST_EXCLUDED_ANALYZERS =~ /security-code-scan/"    when: never
+  - if: "$CI_COMMIT_BRANCH"    exists:    - "**/*.csproj"    - "**/*.vbproj"  variables:    SEARCH_MAX_DEPTH: 4    SAST_ANALYZER_IMAGE_TAG: '3'    SAST_ANALYZER_IMAGE: "$SECURE_ANALYZERS_PREFIX/security-code-scan:$SAST_ANALYZER_IMAGE_TAG"  script:  - "/analyzer run"  extends: ".sast-analyzer"  allow_failure: true  image:    name: "$SAST_ANALYZER_IMAGE"semgrep-sast:  stage: test
+  artifacts:    reports:      sast:      - gl-sast-report.json
+    name: sast
+    paths:    - gl-sast-report.json
+    when: always
+  rules:  - if: "$SAST_DISABLED"    when: never
+  - if: "$SAST_EXCLUDED_ANALYZERS =~ /semgrep/"    when: never
+  - if: "$CI_COMMIT_BRANCH"    exists:    - "**/*.py"    - "**/*.js"    - "**/*.jsx"    - "**/*.ts"    - "**/*.tsx"    - "**/*.c"    - "**/*.go"    - "**/*.java"  variables:    SEARCH_MAX_DEPTH: 20    SAST_ANALYZER_IMAGE_TAG: 3    SAST_ANALYZER_IMAGE: "$SECURE_ANALYZERS_PREFIX/semgrep:$SAST_ANALYZER_IMAGE_TAG$SAST_IMAGE_SUFFIX"  script:  - "/analyzer run"  extends: ".sast-analyzer"  allow_failure: true  image:    name: "$SAST_ANALYZER_IMAGE"sobelow-sast:  stage: test
+  artifacts:    reports:      sast:      - gl-sast-report.json
+    name: sast
+    paths:    - gl-sast-report.json
+    when: always
+  rules:  - if: "$SAST_DISABLED"    when: never
+  - if: "$SAST_EXCLUDED_ANALYZERS =~ /sobelow/"    when: never
+  - if: "$CI_COMMIT_BRANCH"    exists:    - mix.exs
+  variables:    SEARCH_MAX_DEPTH: 4    SAST_ANALYZER_IMAGE_TAG: 3    SAST_ANALYZER_IMAGE: "$SECURE_ANALYZERS_PREFIX/sobelow:$SAST_ANALYZER_IMAGE_TAG"  script:  - "/analyzer run"  extends: ".sast-analyzer"  allow_failure: true  image:    name: "$SAST_ANALYZER_IMAGE"spotbugs-sast:  stage: test
+  artifacts:    reports:      sast:      - gl-sast-report.json
+    name: sast
+    paths:    - gl-sast-report.json
+    when: always
+  rules:  - if: "$SAST_EXCLUDED_ANALYZERS =~ /spotbugs/"    when: never
+  - if: "$SAST_EXPERIMENTAL_FEATURES == 'true'"    exists:    - "**/AndroidManifest.xml"    when: never
+  - if: "$SAST_DISABLED"    when: never
+  - if: "$CI_COMMIT_BRANCH"    exists:    - "**/*.groovy"    - "**/*.java"    - "**/*.scala"    - "**/*.kt"  variables:    SEARCH_MAX_DEPTH: 4    SAST_ANALYZER_IMAGE_TAG: 3    SAST_ANALYZER_IMAGE: "$SECURE_ANALYZERS_PREFIX/spotbugs:$SAST_ANALYZER_IMAGE_TAG"  script:  - "/analyzer run"  extends: ".sast-analyzer"  allow_failure: true  image:    name: "$SAST_ANALYZER_IMAGE"iac-sast:  stage: test
+  artifacts:    reports:      sast:      - gl-sast-report.json
+  rules:  - when: never
+  variables:    SEARCH_MAX_DEPTH: 4  allow_failure: true  script:  - "/analyzer run"kics-iac-sast:  stage: test
+  artifacts:    reports:      sast:      - gl-sast-report.json
+  rules:  - if: "$SAST_DISABLED"    when: never
+  - if: "$SAST_EXCLUDED_ANALYZERS =~ /kics/"    when: never
+  - if: "$CI_COMMIT_BRANCH"  variables:    SEARCH_MAX_DEPTH: 4    SAST_ANALYZER_IMAGE_TAG: 3    SAST_ANALYZER_IMAGE: "$SECURE_ANALYZERS_PREFIX/kics:$SAST_ANALYZER_IMAGE_TAG$SAST_IMAGE_SUFFIX"  allow_failure: true  script:  - "/analyzer run"  extends: iac-sast
+  image:    name: "$SAST_ANALYZER_IMAGE"license_scanning:  stage: test
+  image:    name: "$SECURE_ANALYZERS_PREFIX/license-finder:$LICENSE_MANAGEMENT_VERSION"    entrypoint:    - ''  variables:    LM_REPORT_VERSION: '2.1'    SETUP_CMD: "$LICENSE_MANAGEMENT_SETUP_CMD"  allow_failure: true  script:  - "/run.sh analyze ."  artifacts:    reports:      license_scanning:      - gl-license-scanning-report.json
+  dependencies: []  rules:  - if: "$LICENSE_MANAGEMENT_DISABLED"    when: never
+  - if: "$CI_COMMIT_BRANCH && $GITLAB_FEATURES =~ /\\blicense_scanning\\b/"container_scanning:  image: "$CS_ANALYZER_IMAGE$CS_IMAGE_SUFFIX"  stage: test
+  variables:    GIT_STRATEGY: fetch
+  allow_failure: true  artifacts:    reports:      container_scanning:      - gl-container-scanning-report.json
+      dependency_scanning:      - gl-dependency-scanning-report.json
+    paths:    - gl-container-scanning-report.json
+    - gl-dependency-scanning-report.json
+  dependencies: []  script:  - gtcs scan
+  rules:  - if: "$CONTAINER_SCANNING_DISABLED"    when: never
+  - if: $CI_COMMIT_BRANCH && $CI_GITLAB_FIPS_MODE == "true" && $CS_ANALYZER_IMAGE
+      !~ /-(fips|ubi)\z/
+    variables:      CS_IMAGE_SUFFIX: "-fips"  - if: "$CI_COMMIT_BRANCH"".secret-analyzer":  stage: test
+  image: "$SECURE_ANALYZERS_PREFIX/secrets:$SECRETS_ANALYZER_VERSION$SECRET_DETECTION_IMAGE_SUFFIX"  services: []  allow_failure: true  variables:    GIT_DEPTH: '50'  artifacts:    reports:      secret_detection: gl-secret-detection-report.json
+secret_detection:  stage: test
+  image: "$SECURE_ANALYZERS_PREFIX/secrets:$SECRETS_ANALYZER_VERSION$SECRET_DETECTION_IMAGE_SUFFIX"  services: []  allow_failure: true  variables:    GIT_DEPTH: '50'  artifacts:    reports:      secret_detection:      - gl-secret-detection-report.json
+  extends: ".secret-analyzer"  rules:  - if: "$SECRET_DETECTION_DISABLED"    when: never
+  - if: "$CI_COMMIT_BRANCH"  script:  - "/analyzer run"Aqua-scanner:  rules:  - if: $CI_COMMIT_BRANCH == "main"  image: aquasec/aqua-scanner
+  before_script:  - export AQUA_KEY=$AQUA_KEY
+  - export AQUA_SECRET=$AQUA_SECRET
+  script:  - export AQUA_KEY=$AQUA_KEY
+  - export AQUA_SECRET=$AQUA_SECRET
+  - export AQUA_URL=https://api.eu-1.supply-chain.cloud.aquasec.com
+  - export CSPM_URL=https://eu-1.api.cloudsploit.com
+  - export TRIVY_RUN_AS_PLUGIN=aqua
+  - trivy fs --security-checks config,vuln,secret .
+stages:- ".pre"- build
+- test
+- vulnerability_report
+- aqua
+- ".post"
